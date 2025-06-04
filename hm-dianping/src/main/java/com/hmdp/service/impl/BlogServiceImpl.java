@@ -7,22 +7,29 @@ import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hmdp.dto.Result;
 import com.hmdp.dto.UserDTO;
 import com.hmdp.entity.Blog;
+import com.hmdp.entity.Follow;
+import com.hmdp.entity.ScrollPageResult;
 import com.hmdp.entity.User;
 import com.hmdp.mapper.BlogMapper;
 import com.hmdp.service.IBlogService;
+import com.hmdp.service.IFollowService;
 import com.hmdp.service.IUserService;
+import com.hmdp.utils.RedisConstants;
 import com.hmdp.utils.SystemConstants;
 import com.hmdp.utils.UserHolder;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.ZSetOperations;
 import org.springframework.stereotype.Service;
 
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
 
 import static com.hmdp.utils.RedisConstants.BLOG_LIKED_KEY;
+import static com.hmdp.utils.RedisConstants.FEED_KEY;
 
 /**
  * <p>
@@ -37,6 +44,8 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IB
     private final IUserService userService;
 
     private final StringRedisTemplate stringRedisTemplate;
+
+    private final IFollowService followService;
 
     @Override
     public Result queryHotBlog(Integer current) {
@@ -137,6 +146,84 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IB
 
         // 返回用户
         return Result.ok(userDTOS);
+    }
+
+    @Override
+    public Result saveBlog(Blog blog) {
+        // 获取登录用户
+        UserDTO user = UserHolder.getUser();
+        blog.setUserId(user.getId());
+        // 保存探店博文
+        boolean isSuccess = save(blog);
+        // 判断是否保存成功
+        if (!isSuccess) {
+            return Result.fail("保存博客失败,请稍后重试!");
+        }
+        // 获取博主的所有粉丝
+        List<Follow> followUserId = followService.query().eq("follow_user_id", user.getId()).list();
+
+        // 给博主的所有粉丝推送博主所发的博客
+        for (Follow follow : followUserId) {
+            // 获取所有粉丝的id
+            Long funId = follow.getUserId();
+            // 推送博客给粉丝
+            stringRedisTemplate.opsForZSet().add(RedisConstants.FEED_KEY + funId, blog.getId().toString(), System.currentTimeMillis());
+        }
+        // 返回
+        return Result.ok(blog.getId());
+    }
+
+    @Override
+    public Result queryBlogOfFollow(Long maxTime, Integer offset) {
+        // 1.获取当前用户的id
+        Long userId = UserHolder.getUser().getId();
+
+        // 2.去查询博主发给你的邮件(博客)，即查询自己的收件箱
+        Set<ZSetOperations.TypedTuple<String>> typedTuples = stringRedisTemplate.opsForZSet().
+                reverseRangeByScoreWithScores(FEED_KEY + userId, 0, maxTime, offset, 3);
+        // 3.判断集合是否非空
+        if (typedTuples == null || typedTuples.isEmpty()) {
+            return Result.ok(Collections.emptyList());
+        }
+        // 4.解析数据
+        List<Long> blogIds = new ArrayList<>(typedTuples.size());
+        // 最小时间戳
+        long minTimestamp = 0;
+        // 偏移量
+        int os = 1;
+        for (ZSetOperations.TypedTuple<String> typedTuple : typedTuples) {
+            // 4.1获取的是博客id（所关注博主的），添加进集合中
+            blogIds.add(Long.valueOf(typedTuple.getValue()));
+            // 4.2获取时间戳
+            long queryTimestamp = typedTuple.getScore().longValue();
+            if (queryTimestamp == minTimestamp) {
+                os++;
+            }else {
+                minTimestamp = queryTimestamp;
+                os = 1;
+            }
+        }
+        // 5.根据获取的blogIds来查询博客
+        String idStr = StrUtil.join(",", blogIds);
+        List<Blog> blogs = query().in("id", blogIds).
+                last("ORDER BY FIELD(id, " + idStr + ")").list();
+
+        for (Blog blog : blogs) {
+            // 查询用户信息
+            queryBlogUser(blog);
+
+            // 判断当前用户是否喜欢
+            isCurrentUserIfLiked(blog);
+        }
+
+        // 5.封装数据
+        ScrollPageResult pageResult = new ScrollPageResult();
+        pageResult.setList(blogs);
+        pageResult.setMinTime(minTimestamp);
+        pageResult.setOffset(os);
+
+        // 5.返回
+        return Result.ok(pageResult);
     }
 
     private void queryBlogUser(Blog blog) {
